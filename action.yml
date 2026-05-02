@@ -65,8 +65,8 @@ inputs:
     description: "Prefix for the actions/cache key used by cache-engine. The full key includes runner.os, dagger version, workflow, ref, and sha. Override with a value derived from your source files (for example using hashFiles in the calling workflow) to control invalidation."
     required: false
     default: "dagger-engine"
-  cache-engine-path:
-    description: "Host path to use for the engine state bind mount. Defaults to ${RUNNER_TEMP}/dagger-engine-state."
+  cache-engine-archive:
+    description: "Host file path the engine cache is archived to. Defaults to ${RUNNER_TEMP}/dagger-engine-state.tar.zst."
     required: false
     default: ""
 outputs:
@@ -174,7 +174,7 @@ runs:
       if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.cache-engine-path == '' && format('{0}/dagger-engine-state', runner.temp) || inputs.cache-engine-path }}
+        path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
         key: ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
         restore-keys: |
           ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-
@@ -184,7 +184,7 @@ runs:
       if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       shell: bash
       env:
-        INPUT_CACHE_PATH: ${{ inputs.cache-engine-path }}
+        INPUT_CACHE_ARCHIVE: ${{ inputs.cache-engine-archive }}
       run: |
         set -o pipefail
         echo "::group::Starting Dagger engine with persistent cache mount"
@@ -195,14 +195,27 @@ runs:
           echo "::error::could not determine dagger version"; exit 1
         fi
 
-        cache_path="${INPUT_CACHE_PATH:-${RUNNER_TEMP}/dagger-engine-state}"
+        cache_archive="${INPUT_CACHE_ARCHIVE:-${RUNNER_TEMP}/dagger-engine-state.tar.zst}"
+        # The bind-mount source: a directory the engine writes into. Cache
+        # contents are stored in a tarball (cache_archive) rather than the
+        # directory itself, because BuildKit's overlay work dirs have modes
+        # the unprivileged runner user cannot read directly. We use sudo tar
+        # to bridge between the directory and the runner-readable tarball.
+        state_dir="${RUNNER_TEMP}/dagger-engine-state"
         container_name="dagger-engine.gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-        mkdir -p "$cache_path"
+        mkdir -p "$state_dir"
+
+        if [[ -f "$cache_archive" ]]; then
+          echo "Restoring engine state from $cache_archive ($(stat -c%s "$cache_archive") bytes)"
+          sudo tar --use-compress-program='unzstd' -xf "$cache_archive" -C "$state_dir"
+        else
+          echo "no prior engine state archive at $cache_archive — starting fresh"
+        fi
 
         docker run -d --rm --privileged \
           --name "$container_name" \
-          -v "$cache_path:/var/lib/dagger" \
+          -v "$state_dir:/var/lib/dagger" \
           "registry.dagger.io/engine:$engine_version"
 
         # Wait for the engine to be ready (BuildKit listening). 30s is comfortable
@@ -227,7 +240,8 @@ runs:
         echo "_EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://$container_name" >> "$GITHUB_ENV"
         # Persist for the stop/save steps to pick up
         echo "DAGGER_ENGINE_CONTAINER_NAME=$container_name" >> "$GITHUB_ENV"
-        echo "DAGGER_ENGINE_CACHE_PATH=$cache_path" >> "$GITHUB_ENV"
+        echo "DAGGER_ENGINE_STATE_DIR=$state_dir" >> "$GITHUB_ENV"
+        echo "DAGGER_ENGINE_CACHE_ARCHIVE=$cache_archive" >> "$GITHUB_ENV"
         echo "::endgroup::"
     - id: exec
       if: steps.should-exec.outputs.result == 'true'
@@ -311,7 +325,7 @@ runs:
       if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       shell: bash
       run: |
-        echo "::group::Stopping Dagger engine to flush cache state"
+        echo "::group::Stopping Dagger engine and packing cache state"
         if [[ -z "$DAGGER_ENGINE_CONTAINER_NAME" ]]; then
           echo "no engine container recorded; skipping"
           exit 0
@@ -322,16 +336,26 @@ runs:
         else
           echo "container $DAGGER_ENGINE_CONTAINER_NAME not present"
         fi
-        # The engine wrote /var/lib/dagger as root; the unprivileged runner user
-        # cannot read those files when actions/cache tars them up. Re-own the
-        # directory so the subsequent save step can pack it.
-        if [[ -n "$DAGGER_ENGINE_CACHE_PATH" && -d "$DAGGER_ENGINE_CACHE_PATH" ]]; then
-          sudo chown -R "$(id -u):$(id -g)" "$DAGGER_ENGINE_CACHE_PATH" || true
+
+        # Pack engine state into a single runner-owned tarball. Run tar via
+        # sudo so it can read every file regardless of mode/ownership (the
+        # engine creates root-owned files and BuildKit overlay work dirs
+        # often have mode 0). Output is a regular file the runner can read,
+        # so actions/cache can ferry it without permission grief.
+        if [[ -n "$DAGGER_ENGINE_STATE_DIR" && -d "$DAGGER_ENGINE_STATE_DIR" ]]; then
+          echo "Archiving $DAGGER_ENGINE_STATE_DIR -> $DAGGER_ENGINE_CACHE_ARCHIVE"
+          sudo tar --use-compress-program='zstd -3 -T0' \
+            -cf "$DAGGER_ENGINE_CACHE_ARCHIVE" \
+            -C "$DAGGER_ENGINE_STATE_DIR" .
+          sudo chown "$(id -u):$(id -g)" "$DAGGER_ENGINE_CACHE_ARCHIVE"
+          ls -lh "$DAGGER_ENGINE_CACHE_ARCHIVE"
+        else
+          echo "engine state dir not present; nothing to archive"
         fi
         echo "::endgroup::"
     - id: engine-cache-save
       if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       uses: actions/cache/save@v4
       with:
-        path: ${{ inputs.cache-engine-path == '' && format('{0}/dagger-engine-state', runner.temp) || inputs.cache-engine-path }}
+        path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
         key: ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
