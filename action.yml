@@ -170,16 +170,24 @@ runs:
         echo "args=$args" >> "$GITHUB_OUTPUT"
         echo "call=$call" >> "$GITHUB_OUTPUT"
         echo "check=$check" >> "$GITHUB_OUTPUT"
+    - id: engine-image-restore
+      if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        # The engine image is shared across all jobs that use the same dagger
+        # version, so this key intentionally does NOT include github.job.
+        path: ${{ runner.temp }}/dagger-engine-image.tar
+        key: dagger-engine-image-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}
     - id: engine-cache-restore
       if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       uses: actions/cache/restore@v4
       with:
         path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
-        key: ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+        key: ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
         restore-keys: |
-          ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-
-          ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-
-          ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-
+          ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-
+          ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-
+          ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-
     - id: engine-start
       if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       shell: bash
@@ -196,13 +204,14 @@ runs:
         fi
 
         cache_archive="${INPUT_CACHE_ARCHIVE:-${RUNNER_TEMP}/dagger-engine-state.tar.zst}"
+        image_tar="${RUNNER_TEMP}/dagger-engine-image.tar"
         # The bind-mount source: a directory the engine writes into. Cache
         # contents are stored in a tarball (cache_archive) rather than the
         # directory itself, because BuildKit's overlay work dirs have modes
         # the unprivileged runner user cannot read directly. We use sudo tar
         # to bridge between the directory and the runner-readable tarball.
         state_dir="${RUNNER_TEMP}/dagger-engine-state"
-        container_name="dagger-engine.gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        container_name="dagger-engine.gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
 
         mkdir -p "$state_dir"
 
@@ -211,6 +220,13 @@ runs:
           sudo tar --use-compress-program='unzstd' -xf "$cache_archive" -C "$state_dir"
         else
           echo "no prior engine state archive at $cache_archive — starting fresh"
+        fi
+
+        # Load the engine image from cache if available, otherwise docker run
+        # below will pull it (and we'll save it after the run for next time).
+        if [[ -f "$image_tar" ]]; then
+          echo "Loading engine image from $image_tar ($(stat -c%s "$image_tar") bytes)"
+          docker load -i "$image_tar"
         fi
 
         docker run -d --rm --privileged \
@@ -242,6 +258,8 @@ runs:
         echo "DAGGER_ENGINE_CONTAINER_NAME=$container_name" >> "$GITHUB_ENV"
         echo "DAGGER_ENGINE_STATE_DIR=$state_dir" >> "$GITHUB_ENV"
         echo "DAGGER_ENGINE_CACHE_ARCHIVE=$cache_archive" >> "$GITHUB_ENV"
+        echo "DAGGER_ENGINE_IMAGE_TAR=$image_tar" >> "$GITHUB_ENV"
+        echo "DAGGER_ENGINE_VERSION=$engine_version" >> "$GITHUB_ENV"
         echo "::endgroup::"
     - id: exec
       if: steps.should-exec.outputs.result == 'true'
@@ -352,10 +370,28 @@ runs:
         else
           echo "engine state dir not present; nothing to archive"
         fi
+
+        # Save the engine image to a tarball if we don't already have one
+        # (i.e. on first cold run). The image-save step then caches the file.
+        # Skip if it was restored — the file already exists.
+        if [[ -n "$DAGGER_ENGINE_IMAGE_TAR" && ! -f "$DAGGER_ENGINE_IMAGE_TAR" ]]; then
+          echo "Saving engine image -> $DAGGER_ENGINE_IMAGE_TAR"
+          docker save "registry.dagger.io/engine:$DAGGER_ENGINE_VERSION" \
+            -o "$DAGGER_ENGINE_IMAGE_TAR"
+          ls -lh "$DAGGER_ENGINE_IMAGE_TAR"
+        fi
         echo "::endgroup::"
     - id: engine-cache-save
       if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       uses: actions/cache/save@v4
       with:
         path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
-        key: ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+        key: ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+    - id: engine-image-save
+      # Only save if restore missed (we then created the tarball in engine-stop).
+      # When restore hit, the cache entry already exists at this key.
+      if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true' && steps.engine-image-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/dagger-engine-image.tar
+        key: dagger-engine-image-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}
