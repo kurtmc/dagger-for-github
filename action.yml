@@ -382,7 +382,10 @@ runs:
         fi
         echo "::endgroup::"
     - id: engine-cache-save
-      if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
+      # Skip save when restore was an exact primary-key hit (the cache entry
+      # at this key already exists; save would just hit "another job may be
+      # creating this cache" and emit a misleading warning).
+      if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true' && steps.engine-cache-restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
