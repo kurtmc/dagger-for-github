@@ -62,7 +62,7 @@ inputs:
     required: false
     default: "false"
   cache-engine-key:
-    description: "Prefix for the actions/cache key used by cache-engine. The full key includes runner.os, dagger version, workflow, ref, and sha — set this to a custom suffix to invalidate, e.g. dagger-engine-${{ hashFiles('**/go.sum') }}."
+    description: "Prefix for the actions/cache key used by cache-engine. The full key includes runner.os, dagger version, workflow, ref, and sha. Override with a value derived from your source files (for example using hashFiles in the calling workflow) to control invalidation."
     required: false
     default: "dagger-engine"
   cache-engine-path:
