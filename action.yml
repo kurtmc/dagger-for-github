@@ -57,6 +57,18 @@ inputs:
     description: "Whether to write summary to GITHUB_STEP_SUMMARY"
     required: false
     default: "false"
+  cache-engine:
+    description: "Persist the Dagger engine's /var/lib/dagger state across runs via actions/cache. When true, the action pre-starts the engine container with a host bind mount, points the CLI at it via _EXPERIMENTAL_DAGGER_RUNNER_HOST, and saves/restores the state directory between runs."
+    required: false
+    default: "false"
+  cache-engine-key:
+    description: "Prefix for the actions/cache key used by cache-engine. The full key includes runner.os, dagger version, workflow, ref, and sha — set this to a custom suffix to invalidate, e.g. dagger-engine-${{ hashFiles('**/go.sum') }}."
+    required: false
+    default: "dagger-engine"
+  cache-engine-path:
+    description: "Host path to use for the engine state bind mount. Defaults to ${RUNNER_TEMP}/dagger-engine-state."
+    required: false
+    default: ""
 outputs:
   output:
     description: "Job output"
@@ -158,6 +170,65 @@ runs:
         echo "args=$args" >> "$GITHUB_OUTPUT"
         echo "call=$call" >> "$GITHUB_OUTPUT"
         echo "check=$check" >> "$GITHUB_OUTPUT"
+    - id: engine-cache-restore
+      if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.cache-engine-path == '' && format('{0}/dagger-engine-state', runner.temp) || inputs.cache-engine-path }}
+        key: ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+        restore-keys: |
+          ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-
+          ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-
+          ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-
+    - id: engine-start
+      if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
+      shell: bash
+      env:
+        INPUT_CACHE_PATH: ${{ inputs.cache-engine-path }}
+      run: |
+        set -o pipefail
+        echo "::group::Starting Dagger engine with persistent cache mount"
+
+        # Match the engine image to the installed CLI version to avoid skew
+        engine_version=$(dagger version | awk '{print $2}')
+        if [[ -z "$engine_version" ]]; then
+          echo "::error::could not determine dagger version"; exit 1
+        fi
+
+        cache_path="${INPUT_CACHE_PATH:-${RUNNER_TEMP}/dagger-engine-state}"
+        container_name="dagger-engine.gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+        mkdir -p "$cache_path"
+
+        docker run -d --rm --privileged \
+          --name "$container_name" \
+          -v "$cache_path:/var/lib/dagger" \
+          "registry.dagger.io/engine:$engine_version"
+
+        # Wait for the engine to be ready (BuildKit listening). 30s is comfortable
+        # for warm image pulls; cold pulls of the engine image fall under the
+        # docker run step itself, so the engine should be near-instant once running.
+        ready=0
+        for i in $(seq 1 30); do
+          if docker exec "$container_name" buildctl debug workers >/dev/null 2>&1; then
+            echo "engine ready after ${i}s"
+            ready=1
+            break
+          fi
+          sleep 1
+        done
+        if [[ "$ready" -ne 1 ]]; then
+          echo "::error::dagger engine did not become ready within 30s"
+          docker logs "$container_name" || true
+          exit 1
+        fi
+
+        # Hand the engine off to the CLI for the exec step
+        echo "_EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://$container_name" >> "$GITHUB_ENV"
+        # Persist for the stop/save steps to pick up
+        echo "DAGGER_ENGINE_CONTAINER_NAME=$container_name" >> "$GITHUB_ENV"
+        echo "DAGGER_ENGINE_CACHE_PATH=$cache_path" >> "$GITHUB_ENV"
+        echo "::endgroup::"
     - id: exec
       if: steps.should-exec.outputs.result == 'true'
       shell: bash
@@ -236,3 +307,25 @@ runs:
         if [[ "${{ inputs.enable-github-summary }}" == "true" ]]; then
           summary_content > "${GITHUB_STEP_SUMMARY}"
         fi
+    - id: engine-stop
+      if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
+      shell: bash
+      run: |
+        echo "::group::Stopping Dagger engine to flush cache state"
+        if [[ -z "$DAGGER_ENGINE_CONTAINER_NAME" ]]; then
+          echo "no engine container recorded; skipping"
+          exit 0
+        fi
+        if docker ps -a --format '{{.Names}}' | grep -qx "$DAGGER_ENGINE_CONTAINER_NAME"; then
+          # 60s graceful timeout — BuildKit's shutdown handler flushes its state to disk
+          docker stop -t 60 "$DAGGER_ENGINE_CONTAINER_NAME" || true
+        else
+          echo "container $DAGGER_ENGINE_CONTAINER_NAME not present"
+        fi
+        echo "::endgroup::"
+    - id: engine-cache-save
+      if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ inputs.cache-engine-path == '' && format('{0}/dagger-engine-state', runner.temp) || inputs.cache-engine-path }}
+        key: ${{ inputs.cache-engine-key }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
