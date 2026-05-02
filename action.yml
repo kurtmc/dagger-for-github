@@ -173,6 +173,10 @@ runs:
     - id: engine-image-restore
       if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       uses: actions/cache/restore@v4
+      env:
+        # actions/cache@v4 still ships on Node 20; opt in to Node 24 to
+        # silence the deprecation warning. Will become default 2026-06-02.
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       with:
         # The engine image is shared across all jobs that use the same dagger
         # version, so this key intentionally does NOT include github.job.
@@ -181,6 +185,8 @@ runs:
     - id: engine-cache-restore
       if: inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
       uses: actions/cache/restore@v4
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       with:
         path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
         key: ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
@@ -387,6 +393,8 @@ runs:
       # creating this cache" and emit a misleading warning).
       if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true' && steps.engine-cache-restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       with:
         path: ${{ inputs.cache-engine-archive == '' && format('{0}/dagger-engine-state.tar.zst', runner.temp) || inputs.cache-engine-archive }}
         key: ${{ inputs.cache-engine-key }}-${{ github.job }}-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}-${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
@@ -395,6 +403,8 @@ runs:
       # When restore hit, the cache entry already exists at this key.
       if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true' && steps.engine-image-restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       with:
         path: ${{ runner.temp }}/dagger-engine-image.tar
         key: dagger-engine-image-${{ runner.os }}-${{ inputs.version }}-${{ inputs.commit }}
