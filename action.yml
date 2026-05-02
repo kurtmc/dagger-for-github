@@ -322,6 +322,12 @@ runs:
         else
           echo "container $DAGGER_ENGINE_CONTAINER_NAME not present"
         fi
+        # The engine wrote /var/lib/dagger as root; the unprivileged runner user
+        # cannot read those files when actions/cache tars them up. Re-own the
+        # directory so the subsequent save step can pack it.
+        if [[ -n "$DAGGER_ENGINE_CACHE_PATH" && -d "$DAGGER_ENGINE_CACHE_PATH" ]]; then
+          sudo chown -R "$(id -u):$(id -g)" "$DAGGER_ENGINE_CACHE_PATH" || true
+        fi
         echo "::endgroup::"
     - id: engine-cache-save
       if: always() && inputs.cache-engine == 'true' && steps.should-exec.outputs.result == 'true'
